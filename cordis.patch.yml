@@ -1,0 +1,4 @@
+# dsh-wake bundle layer: mount the plugin into a DSH profile.
+- insert:
+    - id: wake
+      name: dsh-wake
