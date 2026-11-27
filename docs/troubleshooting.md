@@ -4,6 +4,7 @@
 > 数据目录一直空着，宿主日志里什么也看不到。
 >
 > 这份手册来自 2026-11-27 的一次真实排查（dsh-wake 0.1.0 + DSH 桌面 0.2.1-rc.5）。
+> **结论几经更正，正文写的是最后核实过的版本，错误的假设也保留了——它们同样有用。**
 
 ---
 
@@ -50,9 +51,6 @@ try {
 | 写了，`argv` 里是宿主的 exe | 加载器认这个包 | 进第 2 步 |
 | 写了，但 `pid` 每次不同、`argv` 是 node | 那是你自己测试时写的，不是宿主 | 别被自己的日志骗了 |
 
-> **这一步最重要。** 它把"没加载"和"加载了没跑"一刀切开，
-> 而这两种情况此前的修法完全不同。
-
 ### 第 2 步：`apply()` 被调用了吗
 
 ```js
@@ -64,7 +62,7 @@ export function apply(ctx, baseConfig = {}) {
 
 | 结果 | 含义 | 下一步 |
 | --- | --- | --- |
-| 没写 | 加载器 import 了模块，但没把它当插件挂 | 进注 A（挂载判定） |
+| 没写 | 加载器 import 了模块，但没把它当插件挂 | 见第 2 节（本案例停在这一层） |
 | 写了 | 生命周期开始了 | 进第 3 步 |
 
 ### 第 3 步：`tools.register()` 成功了吗
@@ -74,120 +72,161 @@ disposeTool = tools.register(tool) ?? null;
 diag('register-ok', { hasDispose: disposeTool !== null });
 ```
 
-- `hasDispose: true` → 工具进了全局表
-- 抛错 → 看 `register-fail` 里的 error
-
 ### 第 4 步：会话拿到了吗
 
-**全局表里有 ≠ 会话工具清单里有。**
-
-会话 agent 的工具清单在**创建时**快照。
+**全局表里有 ≠ 会话工具清单里有。** 会话 agent 的工具清单在**创建时**快照。
 
 | 检查 | 做法 |
 | --- | --- |
 | 老会话看不到 | **正常**，开新会话再看 |
-| 新会话也看不到 | 检查会话层的工具白名单（例如 fish-soul 的 `allowedTools()` / `CHAT_TOOLS`） |
-
-> fish-soul 这类"收窄工具"的插件要特别看一处：
-> 它会用 `CHAT_TOOLS` 之类的白名单过滤宿主工具。
-> **新工具必须加进那份名单**，否则宿主注册了也到不了会话。
+| 新会话也看不到 | 检查会话层白名单（例：fish-soul 的 `allowedTools()` / `CHAT_TOOLS`） |
 
 ---
 
-## 2. 注 A：加载器 import 了却不挂载
+## 2. 第 2 步过不去时，怎么缩小范围
 
-先确认 profile 的依赖树是不是完整的。用一个几十行的脚本直接跑宿主的 loader：
+本案例停在这里：**模块被 import，`apply` 从不调用。**
 
-```js
-const boot = await import('file:///D:/dsh-rc5/resources/app/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js');
-const prof = boot.loadProfileDirectory('dsh', 'C:/Users/<user>/.dsh/profiles/desktop', 'D:/dsh-rc5/resources/app/dsh');
-console.log('skippedBundles:', JSON.stringify(prof.skippedBundles, null, 1));
-console.log('用户层 rows:', prof.patches.map((p) => p.id ?? Object.keys(p)).join(', '));
+下面四条是当时逐一验证并**排除**掉的假设。都记下来，因为每一条都曾经"看着很像"。
+
+### ① 重复 id？—— 排除
+
+包自带 `dsh.bundle.patch` 时，一旦它进了 `dsh.profile.bundles`，宿主会自动插入一行 `id: xxx`。
+如果在 profile 的 `cordis.patch.yml` 里再写一条同 id 的覆盖行，理论上可能互相吞掉。
+
+**实测**：删掉覆盖行后，`apply` 依然不调用。**不是这个原因。**
+
+不过这条**仍然是值得遵守的写法**：
+
+```yaml
+- id: wake          # 覆盖配置时不要写 insert
+  config: { ... }
 ```
 
-**如果 `skippedBundles` 里连宿主自己的 `@deepseek-ai/dsh-base` / `dsh-web-app` 都在**：
+### ② profile 依赖树坏了？—— 排除（这条是**误报**）
 
-> 这个 profile 的依赖树本来就是残缺的。
-> **新插件不会被挂载**，无论你写 insert 还是放进 bundles —— 两条路都静默跳过。
+曾经用脚本查看 profile 装载结果，看到：
 
-这时不要继续在配置层试。两条出路：
+```json
+"skippedBundles": [
+  "cannot resolve profile bundle @deepseek-ai/dsh-base ...",
+  "cannot resolve profile bundle @deepseek-ai/dsh-web-app ..."
+]
+```
 
-**① 修依赖树（彻底，但风险大）**
+**以为依赖树残缺，其实是脚本传错了参数。**
 
-重装 profile 依赖（等价于 `dsh plugin --profile <name> install`）。
-风险：fish-soul / heartbeat 这些正在用的插件可能一起被牵动。
-
-**② 借一个确定能挂的插件代调 `apply`（临时，但立刻可用）**
+`loadProfileDirectory(binName, dir, installAnchor)` 的第三个参数要 **`package.json` 的路径**，不是目录：
 
 ```js
-// 在一个"确定会被挂载"的插件里（例：fish-soul 的 apply 末尾）
+// ❌ 错：传目录 → 解析失败 → 报 cannot resolve
+boot.loadProfileDirectory('dsh', profileDir, 'D:/dsh-rc5/resources/app/dsh');
+
+// ✅ 对：传 package.json
+boot.loadProfileDirectory('dsh', profileDir, 'D:/dsh-rc5/resources/app/dsh/package.json');
+```
+
+**用正确参数重跑，`skippedBundles` 是空的，六个 bundle 全部正常解析。**
+
+> **教训**：诊断脚本自己也会造出假证据。看到"环境坏了"的结论，先怀疑自己的调用方式。
+
+### ③ insert 行这条路不通？—— 排除
+
+`dsh-screen` 就是用 `insert` 行挂的，它的工具一直可用。
+**说明 insert 这条路本身没问题**，不能拿它当替罪羊。
+
+### ④ peer 写成通配符被拒？—— 排除
+
+```json
+// 曾经是
+"peerDependencies": { "@deepseek-ai/dsh-llm": "*", "@deepseek-ai/schemastery": "*" }
+
+// 改成显式范围后仍然不挂（照 dsh-screen 的写法）
+"peerDependencies": { "@deepseek-ai/dsh-llm": ">=0.2.1-rc.5", "@deepseek-ai/schemastery": "~3.18.5" }
+```
+
+而且用宿主自己的判定函数验证过，**兼容性是通过的**：
+
+```js
+boot.evaluatePluginCompatibility(manifest, {}, '0.2.1-rc.5')   // → undefined（通过）
+```
+
+**结论：不是 peer 的问题。**（显式范围仍然值得保留，它比通配符更诚实。）
+
+### ⑤ 剩下的那段空白
+
+四种假设都排除后，范围只剩一句话：
+
+> **cordis 在"模块 import 完成之后、调用 `apply` 之前"把这一行丢掉了。**
+
+再往下就要读 cordis 运行时的 row 装载逻辑（`dsh-app-boot` 只负责生成 entry 列表，
+真正挂载在 cordis / dsh-runtime 里）。**本案例到此为止，未继续。**
+
+---
+
+## 3. 临时绕行：借一个"确定能挂"的插件代调 `apply`
+
+```js
+// 在一个确定会被挂载的插件里（例：fish-soul 的 apply 末尾）
 if (globalThis.__wakeBridge !== true) {
 	globalThis.__wakeBridge = true;
 	void (async () => {
 		const mod = await import('dsh-wake');
-		await mod.apply(ctx, { enabled: true });
+		await mod.apply(ctx, cfg);      // 同一个 cordis app，ctx.tools 是同一张表
 		log('info', '[bridge] 已代挂 dsh-wake');
 	})();
 }
 ```
 
-**为什么可行**：同一个 cordis app 里，`ctx.tools` 是同一张表；`ctx.agents` 也在。
-所以借它的 ctx 调一次 `apply`，效果等同于宿主自己挂。
+**为什么可行**：同一个 app 里 `ctx.tools` / `ctx.agents` 都是同一份。
+借它的 ctx 调一次 `apply`，效果等同于宿主自己挂。
 
-**必须知道的代价：**
+**代价（必须知道）：**
 
 | 局限 | 说明 |
 | --- | --- |
 | 依赖那个宿主插件先启动 | 它挂了，被代挂的一起没 |
-| 配置写在代码里 | 改配置要改代码，不走设置页 |
+| 配置不走设置页 | 建议让代挂读一个 `config.json`，改文件即可 |
 | 不符合插件规范 | 宿主修好后应删掉这整段 |
+
+**排查用开关**：加一个标记文件（例 `D:/feiyu/wake-bridge.disabled`），
+存在时跳代挂，用来验证"正常挂载到底通不通"，避免代挂把结论污染掉。
 
 ---
 
-## 3. 本次案例记录（2026-11-27）
+## 4. 本次案例记录（2026-11-27，含错误路径）
 
 **症状**：`wake_create` 在新老会话里都看不到；`~\.dsh\dsh-wake\` 一直是空目录。
 
-**试过并排除的（每一步都"看起来对"）**：
+**试过并排除的**：
 
 | 尝试 | 结果 |
 | --- | --- |
-| junction + profile insert 行（同 tieba 的挂法） | 未挂载 |
+| junction + profile insert 行 | 未挂载 |
 | 加进 bundles（同 heartbeat 的挂法） | 未挂载 |
-| 两者同时存在 | 更糟（重复 id，两个都不落地） |
+| 两者同时存在 | 更糟（重复 id） |
 | node_modules 从 junction 改成实体目录 | 未挂载 |
-| 换包名 `dsh-wake-probe` + 换 id `wake-probe` | 未挂载（证明与包名/ id 无关） |
-| 检查 manifest 的 `engines.dsh` / peer 兼容性 | 三个插件都不触发拒绝 |
+| 换包名 `dsh-wake-probe` + 换 id | 未挂载（证明与命名无关） |
+| 删掉 profile 的覆盖行 | 未挂载（证明不是覆盖行） |
+| peer 从 `*` 改成显式范围 | 未挂载（证明不是兼容性） |
 
-**加探针后才知道的事实**：
+**探针给出的事实**：
 
 ```
-module-import    ✅ 写了（宿主 pid，argv 是 DeepSeek Harness.exe）
+module-import    ✅ 写了（宿主 pid）
 apply-enter      ❌ 从来没写过
 ```
 
-**根因**：`skippedBundles` 里有
+**最终结论**：
 
-```json
-{"packageName":"@deepseek-ai/dsh-base","reason":"cannot resolve profile bundle ..."}
-{"packageName":"@deepseek-ai/dsh-web-app","reason":"cannot resolve profile bundle ..."}
-```
-
-→ profile 依赖树残缺，装载链对新插件整体失效。
-
-**解决**：借 fish-soul 的 ctx 代调 `apply()`。
-
-**结果**：
-
-```
-apply-enter    hasTools:true  hasRegister:true
-register-ok    hasDispose:true      ← 工具进表
-apply-ready    dataDir:C:\Users\<user>\.dsh\dsh-wake
-```
+- profile **是好的**（六个 bundle 全部正常解析，`skippedBundles` 为空）
+- 模块**确实被加载**了
+- **`apply` 没有人调用** —— 卡在 cordis 的 row 挂载判定
+- 绕行方案：借 fish-soul 的 ctx 代调 `apply`，工具立刻可用
 
 ---
 
-## 4. 一页检查清单
+## 5. 一页检查清单
 
 ```powershell
 # ① 宿主能不能解析这个包（从 profile 目录）
@@ -200,41 +239,38 @@ Get-Content D:\feiyu\wake-boot.log -Tail 5
 # ③ 插件自己的数据目录建了没
 Get-ChildItem $env:USERPROFILE\.dsh\dsh-wake
 
-# ④ profile 装载器怎么看这个 profile
-node -e "..."   # 见第 2 节脚本，重点看 skippedBundles
+# ④ profile 装载结果（注意第三个参数是 package.json 路径！）
+node --input-type=module -e "
+const boot = await import('file:///D:/dsh-rc5/resources/app/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js');
+const p = boot.loadProfileDirectory('dsh','C:/Users/<user>/.dsh/profiles/desktop','D:/dsh-rc5/resources/app/dsh/package.json');
+console.log('layers:', p.layers.map(l=>l.packageName).join(', '));
+console.log('skipped:', JSON.stringify(p.skippedBundles));
+"
 ```
 
 ---
 
-## 5. 三条容易踩的坑（都是这次踩过的）
+## 6. 三条容易踩的坑（都是这次踩过的）
 
 **① 重复 id 会静默失效**
 
-包自带 `dsh.bundle.patch` 的话，一旦它进了 `dsh.profile.bundles`，
-宿主就会自动插入一行 `id: xxx`。
-此时 profile 的 `cordis.patch.yml` 里**不要再写 `insert` 同一个 id**。
-
-要改配置就用覆盖形式：
-
-```yaml
-- id: wake          # 不写 insert
-  config: { ... }
-```
+包自带 `dsh.bundle.patch` 且进了 `bundles` 时，profile 层不要再 `insert` 同一个 id。
+改配置用覆盖形式（`- id: xxx` + `config:`）。
 
 **② 会话工具清单是快照**
 
 新注册的工具只对**新会话**生效。老会话看不到不是 bug。
 
-**③ 探针不要留在生产代码里**
+**③ 诊断脚本会造假证据**
 
-`diag()` 这类写入只该在排查期存在。
-定位完就删掉，或改成环境变量开关。
+`loadProfileDirectory` 传错锚点就报 "cannot resolve"，看起来像环境坏了。
+**看到"环境有问题"的结论，先核对自己的调用参数。**
 
 ---
 
-## 6. 什么时候该停下来
+## 7. 什么时候该停下来
 
-如果连续三种"看起来正确"的挂载方式都失败，**不要再改配置**。
+连续三种"看起来正确"的挂载方式都失败时，**不要再改配置**。
 
 先加探针，把"哪一道门没过"测出来。
 
